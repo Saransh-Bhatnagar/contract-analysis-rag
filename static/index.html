@@ -505,6 +505,7 @@
       <h1><span>Profound</span> RAG</h1>
     </div>
     <div class="header-status">
+      <button id="clearChatBtn" onclick="clearChat()" style="background: var(--surface-hover); border: 1px solid var(--border); color: var(--text-muted); padding: 6px 12px; border-radius: 8px; font-size: 12px; cursor: pointer; margin-right: 12px;">Clear chat</button>
       <div class="status-dot" id="statusDot"></div>
       <span id="statusText">Connected</span>
     </div>
@@ -568,6 +569,19 @@
   const sendBtn = document.getElementById('sendBtn');
   const welcome = document.getElementById('welcome');
   let isStreaming = false;
+
+  // Conversation history sent to backend for follow-up support.
+  // Capped at last 5 turns (10 messages) to control cost.
+  const MAX_HISTORY_TURNS = 5;
+  let conversationHistory = [];
+
+  function clearChat() {
+    conversationHistory = [];
+    // Remove all messages but keep the welcome screen container
+    const messages = chatArea.querySelectorAll('.message, .typing');
+    messages.forEach(m => m.remove());
+    if (welcome) welcome.style.display = '';
+  }
 
   // --- Markdown renderer ---
   function renderMarkdown(text) {
@@ -760,7 +774,7 @@
       const res = await fetch(`${API}/query`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ question }),
+        body: JSON.stringify({ question, history: conversationHistory }),
       });
 
       // Remove typing
@@ -779,6 +793,13 @@
         chunks: data.chunks_retrieved,
         expanded: data.expanded_query,
       });
+
+      // Push the turn into history, then trim to last MAX_HISTORY_TURNS turns
+      conversationHistory.push({ role: 'user', content: question });
+      conversationHistory.push({ role: 'assistant', content: data.answer });
+      if (conversationHistory.length > MAX_HISTORY_TURNS * 2) {
+        conversationHistory = conversationHistory.slice(-MAX_HISTORY_TURNS * 2);
+      }
 
     } catch (e) {
       typingEl.remove();

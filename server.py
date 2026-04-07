@@ -84,8 +84,19 @@ app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 # ---------------------------------------------------------------------------
 # Request / Response schemas
 # ---------------------------------------------------------------------------
+class Message(BaseModel):
+    role: str  # "user" or "assistant"
+    content: str
+
+
+# Cap history to keep prompts cheap and avoid lost-in-the-middle issues.
+# 5 turns = 10 messages (5 user + 5 assistant) before the new question.
+MAX_HISTORY_TURNS = 5
+
+
 class QueryRequest(BaseModel):
     question: str = Field(..., min_length=1, max_length=1000)
+    history: list[Message] = Field(default_factory=list)
 
 
 class QueryResponse(BaseModel):
@@ -94,6 +105,58 @@ class QueryResponse(BaseModel):
     expanded_query: str
     chunks_retrieved: int
     time_seconds: float
+
+
+# ---------------------------------------------------------------------------
+# Conversation-aware query rewriting
+# ---------------------------------------------------------------------------
+QUERY_REWRITE_PROMPT = """You rewrite follow-up questions into standalone questions for a contract-search system.
+
+You will be given the recent conversation history and a new user question.
+
+Rules:
+1. If the new question is a FOLLOW-UP that depends on prior turns (uses pronouns like "it", "that", "those", or omits the contract/topic name), rewrite it as a fully standalone question that includes the contract name and topic from the prior turns.
+2. If the new question is UNRELATED to prior turns or already self-contained, return it UNCHANGED.
+3. Output ONLY the rewritten (or unchanged) question. No preamble, no explanation, no quotes."""
+
+
+def rewrite_query_with_history(question: str, history: list[Message]) -> str:
+    """
+    If the new question is a follow-up, rewrite it as a standalone query using
+    the conversation history. Otherwise return the question unchanged.
+    Falls back to the original question on any error.
+    """
+    if not history:
+        return question
+
+    # Use only the most recent turns
+    recent = history[-(MAX_HISTORY_TURNS * 2):]
+    history_text = "\n".join(f"{m.role.upper()}: {m.content}" for m in recent)
+
+    try:
+        completion = openai_client.chat.completions.create(
+            model=GENERATION_MODEL,
+            messages=[
+                {"role": "system", "content": QUERY_REWRITE_PROMPT},
+                {"role": "user", "content": (
+                    f"Conversation history:\n{history_text}\n\n"
+                    f"New question: {question}\n\n"
+                    f"Standalone question:"
+                )},
+            ],
+            temperature=0.0,
+            max_tokens=200,
+        )
+        rewritten = completion.choices[0].message.content.strip().strip('"').strip("'")
+        return rewritten or question
+    except Exception:
+        return question
+
+
+def build_history_messages(history: list[Message]) -> list[dict]:
+    """Convert capped history to OpenAI message dicts."""
+    recent = history[-(MAX_HISTORY_TURNS * 2):]
+    return [{"role": m.role, "content": m.content} for m in recent]
 
 
 # ---------------------------------------------------------------------------
@@ -569,10 +632,13 @@ def extract_topic_from_query(question: str) -> str:
 async def query(req: QueryRequest):
     start = time.time()
 
+    # Rewrite follow-up questions into standalone queries before retrieval
+    retrieval_question = rewrite_query_with_history(req.question, req.history)
+
     # Auto-route: if the user asks about a topic across all contracts,
     # use the exhaustive topic scan instead of RAG
-    if is_broad_query(req.question):
-        topic = extract_topic_from_query(req.question)
+    if is_broad_query(retrieval_question):
+        topic = extract_topic_from_query(retrieval_question)
         topic_req = TopicScanRequest(topic=topic)
         result = await scan_topic(topic_req)
         return QueryResponse(
@@ -583,7 +649,7 @@ async def query(req: QueryRequest):
             time_seconds=result.time_seconds,
         )
 
-    expanded, top_chunks, all_chunks = run_retrieval_pipeline(req.question)
+    expanded, top_chunks, all_chunks = run_retrieval_pipeline(retrieval_question)
 
     if not top_chunks:
         return QueryResponse(
@@ -594,7 +660,7 @@ async def query(req: QueryRequest):
             time_seconds=round(time.time() - start, 2),
         )
 
-    # Generate answer
+    # Generate answer — pass prior turns so the LLM has conversational context
     context_block = build_context_block(top_chunks)
     user_message = (
         f"Contract excerpts for context:\n\n"
@@ -603,12 +669,13 @@ async def query(req: QueryRequest):
         f"Question: {req.question}"
     )
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(build_history_messages(req.history))
+    messages.append({"role": "user", "content": user_message})
+
     completion = openai_client.chat.completions.create(
         model=GENERATION_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
+        messages=messages,
         temperature=0.2,
     )
 
@@ -631,9 +698,12 @@ async def query(req: QueryRequest):
 async def query_stream(req: QueryRequest):
     import json as _json
 
+    # Rewrite follow-up questions into standalone queries before retrieval
+    retrieval_question = rewrite_query_with_history(req.question, req.history)
+
     # Auto-route broad queries to topic scan (streamed)
-    if is_broad_query(req.question):
-        topic = extract_topic_from_query(req.question)
+    if is_broad_query(retrieval_question):
+        topic = extract_topic_from_query(retrieval_question)
         topic_req = TopicScanRequest(topic=topic)
         result = await scan_topic(topic_req)
 
@@ -655,7 +725,7 @@ async def query_stream(req: QueryRequest):
 
         return StreamingResponse(broad_stream(), media_type="text/event-stream")
 
-    expanded, top_chunks, all_chunks = run_retrieval_pipeline(req.question)
+    expanded, top_chunks, all_chunks = run_retrieval_pipeline(retrieval_question)
 
     if not top_chunks:
         async def empty_stream():
@@ -671,13 +741,14 @@ async def query_stream(req: QueryRequest):
         f"Question: {req.question}"
     )
 
+    messages = [{"role": "system", "content": SYSTEM_PROMPT}]
+    messages.extend(build_history_messages(req.history))
+    messages.append({"role": "user", "content": user_message})
+
     # OpenAI streaming
     stream = openai_client.chat.completions.create(
         model=GENERATION_MODEL,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": user_message},
-        ],
+        messages=messages,
         temperature=0.2,
         stream=True,
     )
