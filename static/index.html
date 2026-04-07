@@ -318,7 +318,7 @@
       line-height: 1.7;
     }
 
-    .message-assistant h1, .message-assistant h2, .message-assistant h3 {
+    .message-assistant h1, .message-assistant h2, .message-assistant h3, .message-assistant h4 {
       margin-top: 16px;
       margin-bottom: 8px;
     }
@@ -326,6 +326,7 @@
     .message-assistant h1 { font-size: 18px; }
     .message-assistant h2 { font-size: 16px; }
     .message-assistant h3 { font-size: 15px; }
+    .message-assistant h4 { font-size: 14px; font-weight: 600; }
 
     .message-assistant p { margin-bottom: 8px; }
 
@@ -657,10 +658,11 @@
       // Non-list line
       closeAll();
 
-      // Headers
-      if (trimmed.startsWith('### ')) { html += `<h3>${trimmed.slice(4)}</h3>`; continue; }
-      if (trimmed.startsWith('## '))  { html += `<h2>${trimmed.slice(3)}</h2>`; continue; }
-      if (trimmed.startsWith('# '))   { html += `<h1>${trimmed.slice(2)}</h1>`; continue; }
+      // Headers — check longest prefix first so #### isn't matched by ###
+      if (trimmed.startsWith('#### ')) { html += `<h4>${trimmed.slice(5)}</h4>`; continue; }
+      if (trimmed.startsWith('### '))  { html += `<h3>${trimmed.slice(4)}</h3>`; continue; }
+      if (trimmed.startsWith('## '))   { html += `<h2>${trimmed.slice(3)}</h2>`; continue; }
+      if (trimmed.startsWith('# '))    { html += `<h1>${trimmed.slice(2)}</h1>`; continue; }
 
       // Empty line — don't close lists if next non-empty line is a list item
       if (trimmed === '') {
