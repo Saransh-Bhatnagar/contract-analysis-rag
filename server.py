@@ -653,6 +653,21 @@ BROAD_PREFIX_PATTERNS = [
 ]
 
 
+import re
+
+# Matches: "what licensing contracts", "which payment agreements", "list all NDA documents", etc.
+# Group 1 captures the optional descriptor between the question word and contracts/agreements/documents.
+BROAD_REGEX = re.compile(
+    r"^\s*(?:what|which|find|list|show(?:\s+me)?|any|how\s+many)"
+    r"(?:\s+all)?"
+    r"(?:\s+(?:of\s+)?(?:my|the))?"
+    r"\s+([\w\-\s]*?)"
+    r"\s*(?:contracts?|agreements?|documents?|deals?)"
+    r"\b",
+    re.IGNORECASE,
+)
+
+
 def is_broad_query(question: str) -> bool:
     """Return True if the question asks about a topic across all contracts."""
     q = question.lower().strip()
@@ -660,25 +675,45 @@ def is_broad_query(question: str) -> bool:
         return True
     if any(q.startswith(prefix) for prefix in BROAD_PREFIX_PATTERNS):
         return True
+    if BROAD_REGEX.match(q):
+        return True
     return False
 
 
 def extract_topic_from_query(question: str) -> str:
     """Strip the 'across all contracts' part to get the core topic."""
+    # First try the regex — it cleanly captures the descriptor between the
+    # question word and the noun ("what LICENSING contracts" → "licensing")
+    m = BROAD_REGEX.match(question.strip())
+    if m:
+        descriptor = m.group(1).strip()
+        # Re-attach the trailing portion of the query (after "contracts/agreements/etc")
+        tail = question[m.end():].strip().rstrip("?.!").strip()
+        # Clean leading filler from the tail
+        for filler in ("do i have", "are there", "exist", "have", "contain", "with", "for", "about", "that", "which"):
+            if tail.lower().startswith(filler):
+                tail = tail[len(filler):].strip()
+        if descriptor and tail:
+            return f"{descriptor} {tail}".strip()
+        if descriptor:
+            return descriptor
+        if tail:
+            return tail
+        # No descriptor + no tail → user just asked "what contracts do i have"
+        return "list all contracts"
+
+    # Fallback for the older BROAD_SIGNALS path
     q = question
-    # Remove broad signals to isolate the topic
     q_lower = q.lower()
     for signal in sorted(BROAD_SIGNALS, key=len, reverse=True):
         idx = q_lower.find(signal)
         if idx != -1:
             q = q[:idx] + q[idx + len(signal):]
             q_lower = q.lower()
-    # Strip broad prefix patterns ("which contracts", "find documents", etc.)
     for prefix in sorted(BROAD_PREFIX_PATTERNS, key=len, reverse=True):
         if q.lower().strip().startswith(prefix):
             q = q.strip()[len(prefix):].strip()
             break
-    # Clean up leftover words
     for filler in ["what are the", "what is the", "list the", "show me",
                     "compare the", "summarize the", "summarise the",
                     "find the", "get the", "have", "contain", "with",
