@@ -171,7 +171,7 @@ SMALL_TALK_PATTERNS = {
 }
 
 SMALL_TALK_RESPONSES = {
-    "greeting": "Hi! I'm a contract analysis assistant. Ask me anything about clauses, risks, or terms in your ingested contracts — for example, *\"What's the termination clause in the Sonos agreement?\"* or *\"Which contracts have liability caps above $5M?\"*",
+    "greeting": "Hi! I'm a contract analysis assistant. Ask me anything about clauses, risks, or terms in your ingested contracts — for example, *\"What's the termination clause in the MSA Logistics agreement?\"* or *\"Which contracts have liability caps above $5M?\"*",
     "thanks": "You're welcome! Let me know if you have more questions about your contracts.",
     "farewell": "Goodbye! Come back anytime with more contract questions.",
     "identity": "I'm a RAG-powered contract analysis assistant. I search across all ingested contracts in your portfolio and answer questions about specific clauses, risks, terms, and obligations. Try asking about a specific contract by name, or use the **Scan Topic Across All** button on the left to compare a topic across every document.",
@@ -501,6 +501,11 @@ Your job is to find and summarise EVERY instance of the requested topic across A
 
 class TopicScanRequest(BaseModel):
     topic: str = Field(..., min_length=1, max_length=500)
+    # Optional: the user's original question. If provided, the LLM is asked
+    # to answer THIS question using clauses retrieved by the (broader) topic.
+    # Lets us strip quantitative filters from `topic` for better recall while
+    # still applying them at synthesis time.
+    original_question: str | None = None
 
 
 class TopicScanResponse(BaseModel):
@@ -602,17 +607,34 @@ async def scan_topic(req: TopicScanRequest):
     context_block = "\n".join(context_parts)
 
     # Step 5 — Send to LLM
+    # If an original question was supplied, ask the LLM to answer THAT specific
+    # question (which may include quantitative filters like "above $5M") using
+    # the broader retrieved clauses. Otherwise fall back to topic summary mode.
+    if req.original_question:
+        user_content = (
+            f"User's question: {req.original_question}\n\n"
+            f"Below are {total_chunks} clauses from {len(by_doc)} contracts "
+            f"related to '{req.topic}'.\n"
+            f"Read EVERY clause carefully and answer the user's question precisely.\n"
+            f"Apply any filters in the question (dollar thresholds, time windows, "
+            f"specific party types) yourself — only include contracts that actually "
+            f"satisfy the filter. EXCLUDE contracts that do not match.\n\n"
+            f"{context_block}"
+        )
+    else:
+        user_content = (
+            f"Topic: {req.topic}\n\n"
+            f"Below are {total_chunks} clauses from {len(by_doc)} contracts "
+            f"that may contain information about this topic.\n"
+            f"Analyse every contract and provide a comprehensive summary.\n\n"
+            f"{context_block}"
+        )
+
     completion = openai_client.chat.completions.create(
         model=GENERATION_MODEL,
         messages=[
             {"role": "system", "content": TOPIC_SCAN_SYSTEM_PROMPT},
-            {"role": "user", "content": (
-                f"Topic: {req.topic}\n\n"
-                f"Below are {total_chunks} clauses from {len(by_doc)} contracts "
-                f"that may contain information about this topic.\n"
-                f"Analyse every contract and provide a comprehensive summary.\n\n"
-                f"{context_block}"
-            )},
+            {"role": "user", "content": user_content},
         ],
         temperature=0.1,
     )
@@ -678,6 +700,24 @@ def is_broad_query(question: str) -> bool:
     if BROAD_REGEX.match(q):
         return True
     return False
+
+
+# Patterns that constrain the answer (e.g. "above $5M", "less than 30 days").
+# These are stripped from the topic used for keyword retrieval but applied at
+# synthesis time via the original_question pass-through.
+QUANTITATIVE_FILTER_REGEX = re.compile(
+    r"\s+(?:above|below|over|under|more\s+than|less\s+than|greater\s+than|"
+    r"exceeding|at\s+least|at\s+most|up\s+to|"
+    r"higher\s+than|lower\s+than)\s+"
+    r"\$?[\d,.]+\s*(?:m|million|k|thousand|b|billion)?",
+    re.IGNORECASE,
+)
+
+
+def strip_quantitative_filters(topic: str) -> str:
+    """Remove dollar/numeric thresholds from a topic so keyword search works."""
+    cleaned = QUANTITATIVE_FILTER_REGEX.sub("", topic).strip()
+    return cleaned or topic
 
 
 def extract_topic_from_query(question: str) -> str:
@@ -750,8 +790,11 @@ async def query(req: QueryRequest):
     # Auto-route: if the user asks about a topic across all contracts,
     # use the exhaustive topic scan instead of RAG
     if is_broad_query(retrieval_question):
-        topic = extract_topic_from_query(retrieval_question)
-        topic_req = TopicScanRequest(topic=topic)
+        raw_topic = extract_topic_from_query(retrieval_question)
+        # Strip quantitative filters ("above $5M") from the keyword-search topic;
+        # they'll be reapplied by the LLM via original_question.
+        topic = strip_quantitative_filters(raw_topic)
+        topic_req = TopicScanRequest(topic=topic, original_question=req.question)
         result = await scan_topic(topic_req)
         return QueryResponse(
             answer=result.answer,
@@ -831,8 +874,9 @@ async def query_stream(req: QueryRequest):
 
     # Auto-route broad queries to topic scan (streamed)
     if is_broad_query(retrieval_question):
-        topic = extract_topic_from_query(retrieval_question)
-        topic_req = TopicScanRequest(topic=topic)
+        raw_topic = extract_topic_from_query(retrieval_question)
+        topic = strip_quantitative_filters(raw_topic)
+        topic_req = TopicScanRequest(topic=topic, original_question=req.question)
         result = await scan_topic(topic_req)
 
         def broad_stream():
