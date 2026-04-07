@@ -1,0 +1,47 @@
+# Environment variables (API keys!)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+*.egg
+venv/
+.venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Debug output
+debug_out.txt
+output.txt
+
+# Local data — too large / not needed in repo
+dummy_dataset/
+cuad_data/
+cuad_eval/
+cuad_eval_results.json
+*.jsonl
+
+# Memory / scratch
+memory/
+
+# Local model cache
+models/
+.cache/
+
+# Eval results — too large / regenerable
+eval_results.json
+cuad_eval_results.json
+
+# Claude Code local settings
+.claude/

@@ -1,0 +1,30 @@
+# Keep the Lambda image small — exclude everything not needed at runtime.
+.git
+.github
+.venv
+venv
+env
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Local data and dev artifacts
+dummy_dataset
+cuad_data
+cuad_eval
+cuad_eval_results.json
+debug_out.txt
+output.txt
+eval_*.py
+ingest_to_db.py
+
+# IDE / OS
+.vscode
+.idea
+.DS_Store
+Thumbs.db
+
+# Memory / scratch
+memory
+*.md
