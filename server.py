@@ -160,6 +160,49 @@ def build_history_messages(history: list[Message]) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Small-talk detection — short-circuits greetings/thanks/identity questions
+# so we don't waste retrieval + an LLM call on "hello".
+# ---------------------------------------------------------------------------
+SMALL_TALK_PATTERNS = {
+    "greeting": {"hi", "hello", "hey", "yo", "sup", "howdy", "hiya", "greetings", "good morning", "good afternoon", "good evening"},
+    "thanks": {"thanks", "thank you", "ty", "thx", "thank u", "appreciate it", "cheers"},
+    "farewell": {"bye", "goodbye", "see ya", "cya", "later", "see you"},
+    "identity": {"who are you", "what are you", "what can you do", "help", "what do you do", "how do you work", "what is this"},
+}
+
+SMALL_TALK_RESPONSES = {
+    "greeting": "Hi! I'm a contract analysis assistant. Ask me anything about clauses, risks, or terms in your ingested contracts — for example, *\"What's the termination clause in the Sonos agreement?\"* or *\"Which contracts have liability caps above $5M?\"*",
+    "thanks": "You're welcome! Let me know if you have more questions about your contracts.",
+    "farewell": "Goodbye! Come back anytime with more contract questions.",
+    "identity": "I'm a RAG-powered contract analysis assistant. I search across all ingested contracts in your portfolio and answer questions about specific clauses, risks, terms, and obligations. Try asking about a specific contract by name, or use the **Scan Topic Across All** button on the left to compare a topic across every document.",
+}
+
+
+def detect_small_talk(question: str) -> str | None:
+    """
+    Return the small-talk category if the question is greeting/thanks/farewell/identity.
+    Returns None if it looks like a real query that should hit retrieval.
+    """
+    q = question.strip().lower().rstrip("?!.,")
+    if not q:
+        return None
+
+    # Exact match against any pattern
+    for category, patterns in SMALL_TALK_PATTERNS.items():
+        if q in patterns:
+            return category
+
+    # Very short input (1-2 words) with no question mark — probably small talk
+    word_count = len(q.split())
+    if word_count <= 2 and "?" not in question:
+        for category, patterns in SMALL_TALK_PATTERNS.items():
+            if any(p in q for p in patterns):
+                return category
+
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Shared retrieval logic (used by both /query and /query/stream)
 # ---------------------------------------------------------------------------
 def run_retrieval_pipeline(question: str) -> tuple[str, list[dict], list[dict]]:
@@ -596,11 +639,28 @@ BROAD_SIGNALS = [
     "compare all", "list all", "summarize all", "summarise all",
 ]
 
+# Patterns that imply "scan the whole corpus" without saying "all contracts" explicitly.
+# Triggered when the question starts with phrases like "which contracts have...".
+BROAD_PREFIX_PATTERNS = [
+    "which contracts", "which agreements", "which documents",
+    "what contracts", "what agreements", "what documents",
+    "find contracts", "find agreements", "find documents",
+    "list contracts", "list agreements", "list documents",
+    "show contracts", "show agreements", "show documents",
+    "show me contracts", "show me agreements", "show me documents",
+    "any contracts", "any agreements", "any documents",
+    "how many contracts", "how many agreements", "how many documents",
+]
+
 
 def is_broad_query(question: str) -> bool:
     """Return True if the question asks about a topic across all contracts."""
-    q = question.lower()
-    return any(signal in q for signal in BROAD_SIGNALS)
+    q = question.lower().strip()
+    if any(signal in q for signal in BROAD_SIGNALS):
+        return True
+    if any(q.startswith(prefix) for prefix in BROAD_PREFIX_PATTERNS):
+        return True
+    return False
 
 
 def extract_topic_from_query(question: str) -> str:
@@ -613,10 +673,16 @@ def extract_topic_from_query(question: str) -> str:
         if idx != -1:
             q = q[:idx] + q[idx + len(signal):]
             q_lower = q.lower()
+    # Strip broad prefix patterns ("which contracts", "find documents", etc.)
+    for prefix in sorted(BROAD_PREFIX_PATTERNS, key=len, reverse=True):
+        if q.lower().strip().startswith(prefix):
+            q = q.strip()[len(prefix):].strip()
+            break
     # Clean up leftover words
     for filler in ["what are the", "what is the", "list the", "show me",
                     "compare the", "summarize the", "summarise the",
-                    "find the", "get the", "in", "from", "?"]:
+                    "find the", "get the", "have", "contain", "with",
+                    "in", "from", "?"]:
         q_lower_stripped = q.lower().strip()
         if q_lower_stripped.startswith(filler):
             q = q[len(filler):].strip()
@@ -631,6 +697,17 @@ def extract_topic_from_query(question: str) -> str:
 @app.post("/query", response_model=QueryResponse)
 async def query(req: QueryRequest):
     start = time.time()
+
+    # Short-circuit small talk so we don't waste retrieval + an LLM call
+    small_talk_category = detect_small_talk(req.question)
+    if small_talk_category:
+        return QueryResponse(
+            answer=SMALL_TALK_RESPONSES[small_talk_category],
+            sources=[],
+            expanded_query=req.question,
+            chunks_retrieved=0,
+            time_seconds=round(time.time() - start, 2),
+        )
 
     # Rewrite follow-up questions into standalone queries before retrieval
     retrieval_question = rewrite_query_with_history(req.question, req.history)
@@ -697,6 +774,22 @@ async def query(req: QueryRequest):
 @app.post("/query/stream")
 async def query_stream(req: QueryRequest):
     import json as _json
+
+    # Short-circuit small talk so we don't waste retrieval + an LLM call
+    small_talk_category = detect_small_talk(req.question)
+    if small_talk_category:
+        canned = SMALL_TALK_RESPONSES[small_talk_category]
+
+        def small_talk_stream():
+            meta = _json.dumps({"sources": [], "expanded_query": req.question})
+            yield f"data: {meta}\n\n"
+            chunk_size = 40
+            for i in range(0, len(canned), chunk_size):
+                fragment = canned[i:i + chunk_size].replace("\n", "\\n")
+                yield f"data: {fragment}\n\n"
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(small_talk_stream(), media_type="text/event-stream")
 
     # Rewrite follow-up questions into standalone queries before retrieval
     retrieval_question = rewrite_query_with_history(req.question, req.history)
