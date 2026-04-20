@@ -846,45 +846,67 @@ def format_date_answer(question: str, flt: dict, rows: list[dict]) -> str:
         return f"No contracts match {criteria}."
 
     today_iso = date.today().isoformat()
-    lines = [f"**{len(rows)} contract{'s' if len(rows) != 1 else ''} matched:**\n"]
-    for i, r in enumerate(rows, 1):
-        lines.append(f"{i}. **{r['document_name']}**")
-        if r.get("contract_type"):
-            lines.append(f"   - Type: {r['contract_type']}")
-        if r.get("parties"):
-            lines.append("   - Parties:")
-            for p in r["parties"][:8]:
-                lines.append(f"     - {p}")
-            if len(r["parties"]) > 8:
-                lines.append(f"     - _(+{len(r['parties']) - 8} more)_")
-        if r.get("effective_date"):
-            lines.append(f"   - Effective: {r['effective_date']}")
-        if r.get("expiration_date"):
-            expired = r["expiration_date"] < today_iso
-            suffix = " _(already expired)_" if expired else ""
-            lines.append(f"   - Expires: {r['expiration_date']}{suffix}")
-        if r.get("term_months"):
-            months = r["term_months"]
-            if months >= 12 and months % 12 == 0:
-                years = months // 12
-                term_str = f"{months} months ({years} year{'s' if years != 1 else ''})"
-            else:
-                term_str = f"{months} months"
-            lines.append(f"   - Term: {term_str}")
-        if r.get("renewal_type") and r["renewal_type"] != "unknown":
-            notice = r.get("auto_renewal_notice_days")
-            if r["renewal_type"] == "auto" and notice:
-                lines.append(f"   - Renewal: auto ({notice}-day notice to cancel)")
-            else:
-                lines.append(f"   - Renewal: {r['renewal_type']}")
-        if r.get("governing_law"):
-            lines.append(f"   - Governing law: {r['governing_law']}")
-        lines.append("")
-    lines.append(
-        "_Ask for a specific clause by name (e.g. \"show me the renewal clause in MSA_Logistics\") "
-        "if you need the exact contract language._"
-    )
-    return "\n".join(lines)
+
+    def fmt_term(months: int | None) -> str:
+        if not months:
+            return "—"
+        if months >= 12 and months % 12 == 0:
+            years = months // 12
+            return f"{months} mo ({years}y)"
+        return f"{months} mo"
+
+    def fmt_renewal(r: dict) -> str:
+        rt = r.get("renewal_type")
+        if not rt or rt == "unknown":
+            return "—"
+        notice = r.get("auto_renewal_notice_days")
+        if rt == "auto" and notice:
+            return f"auto ({notice}-day notice)"
+        return rt
+
+    def fmt_expires(d: str | None) -> str:
+        if not d:
+            return "—"
+        if d < today_iso:
+            return f"{d} *(expired)*"
+        return d
+
+    def fmt_parties(parties: list[str] | None) -> str:
+        if not parties:
+            return "—"
+        # <br> lets the frontend show each party on its own line inside the cell
+        shown = parties[:6]
+        out = "<br>".join(shown)
+        if len(parties) > 6:
+            out += f"<br>*(+{len(parties) - 6} more)*"
+        return out
+
+    header = "| Contract | Type | Parties | Effective | Expires | Term | Renewal | Law |"
+    sep    = "| --- | --- | --- | --- | --- | --- | --- | --- |"
+    body = []
+    for r in rows:
+        body.append(
+            f"| **{r['document_name']}** "
+            f"| {r.get('contract_type') or '—'} "
+            f"| {fmt_parties(r.get('parties'))} "
+            f"| {r.get('effective_date') or '—'} "
+            f"| {fmt_expires(r.get('expiration_date'))} "
+            f"| {fmt_term(r.get('term_months'))} "
+            f"| {fmt_renewal(r)} "
+            f"| {r.get('governing_law') or '—'} |"
+        )
+
+    out_lines = [
+        f"**{len(rows)} contract{'s' if len(rows) != 1 else ''} matched:**",
+        "",
+        header,
+        sep,
+        *body,
+        "",
+        "*Ask for a specific clause by name (e.g. \"show me the renewal clause in MSA_Logistics\") "
+        "if you need the exact contract language.*",
+    ]
+    return "\n".join(out_lines)
 
 
 def handle_date_query(question: str) -> tuple[str, int] | None:

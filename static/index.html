@@ -369,6 +369,28 @@
       margin-left: 16px;
     }
 
+    .message-assistant table {
+      border-collapse: collapse;
+      margin: 10px 0;
+      font-size: 13px;
+      width: 100%;
+      display: block;
+      overflow-x: auto;
+    }
+    .message-assistant th,
+    .message-assistant td {
+      border: 1px solid var(--border);
+      padding: 6px 10px;
+      text-align: left;
+      vertical-align: top;
+    }
+    .message-assistant th {
+      background: var(--tag-bg);
+      font-weight: 600;
+      color: #fff;
+    }
+    .message-assistant td em { color: var(--accent); }
+
     .message-meta {
       display: flex;
       align-items: center;
@@ -609,6 +631,7 @@
       line = line
         .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
         .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>')
+        .replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, '$1<em>$2</em>')
         .replace(/`(.+?)`/g, '<code>$1</code>');
 
       const trimmed = line.trim();
@@ -657,6 +680,39 @@
 
       // Non-list line
       closeAll();
+
+      // Table — header row `| A | B |` followed by separator `| --- | --- |`
+      if (trimmed.startsWith('|') && trimmed.endsWith('|')) {
+        const rawNext = (i + 1 < lines.length) ? lines[i + 1].trim() : '';
+        if (/^\|[\s:\-|]+\|$/.test(rawNext) && rawNext.includes('-')) {
+          const splitRow = (s) => s.slice(1, -1).split('|').map(c => c.trim());
+          const headers = splitRow(trimmed);
+          const bodyRows = [];
+          let j = i + 2;
+          while (j < lines.length) {
+            const raw = lines[j];
+            // re-apply inline formatting on each raw line (we're reading ahead)
+            const formatted = raw
+              .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+              .replace(/(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)/g, '<em>$1</em>')
+              .replace(/(^|[^\w])_([^_\n]+)_(?=[^\w]|$)/g, '$1<em>$2</em>')
+              .replace(/`(.+?)`/g, '<code>$1</code>')
+              .trim();
+            if (!formatted.startsWith('|') || !formatted.endsWith('|')) break;
+            bodyRows.push(splitRow(formatted));
+            j++;
+          }
+          html += '<table><thead><tr>' +
+            headers.map(h => `<th>${h}</th>`).join('') +
+            '</tr></thead><tbody>';
+          for (const row of bodyRows) {
+            html += '<tr>' + row.map(c => `<td>${c}</td>`).join('') + '</tr>';
+          }
+          html += '</tbody></table>';
+          i = j - 1;
+          continue;
+        }
+      }
 
       // Headers — check longest prefix first so #### isn't matched by ###
       if (trimmed.startsWith('#### ')) { html += `<h4>${trimmed.slice(5)}</h4>`; continue; }
