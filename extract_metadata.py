@@ -88,7 +88,13 @@ Rules:
     "none"    → contract has a fixed end with no renewal provision
     "unknown" → can't tell from the excerpt
 - auto_renewal_notice_days: days of notice required to prevent auto-renewal (integer). Null otherwise.
-- parties: clean legal entity names. Omit titles like "(hereinafter 'Vendor')".
+- parties: each entry formatted as "Role: Entity Name". Use the role that matches
+  the contract type, e.g. "Lessor: Acme Corp" / "Lessee: Beta LLC",
+  "Licensor: X" / "Licensee: Y", "Client: X" / "Vendor: Y" (or "Provider"),
+  "Buyer: X" / "Seller: Y", "Employer: X" / "Employee: Y",
+  "Disclosing Party: X" / "Receiving Party: Y", "Prime: X" / "Subcontractor: Y".
+  Omit boilerplate like "(hereinafter 'Vendor')". If the role genuinely
+  cannot be determined, use "Party: <name>".
 - governing_law: the jurisdiction (e.g. "Delaware", "New York", "England and Wales").
 - contract_type: short label like "MSA", "licensing", "NDA", "services", "distribution",
   "supply", "employment", "franchise". Use lowercase.
