@@ -720,6 +720,187 @@ def strip_quantitative_filters(topic: str) -> str:
     return cleaned or topic
 
 
+# ---------------------------------------------------------------------------
+# Date-based query routing
+#
+# Date/renewal questions ("contracts expiring in May 2026", "pending renewals
+# in next 90 days", "auto-renewing agreements") are answered by SQL against
+# `contract_metadata`, NOT by vector search. The LLM is great at language but
+# bad at arithmetic; doing date math in code is exact and deterministic.
+# ---------------------------------------------------------------------------
+import json as _json_module
+from datetime import date
+
+DATE_INDICATORS = (
+    "expir", "renew", "pending renewal", "auto-renew", "auto renew",
+    "automatically renew", "effective", "commencement", "ending",
+    "term ends", "term end", "ends on", "ends in",
+)
+
+DATE_LIST_STARTERS = (
+    "which", "what", "list", "find", "show", "any", "how many",
+)
+
+DATE_TIME_WINDOWS = (
+    "next month", "next year", "next quarter", "this month", "this year",
+    "this quarter", "in the next", "within the next", "within",
+    "in january", "in february", "in march", "in april", "in may",
+    "in june", "in july", "in august", "in september", "in october",
+    "in november", "in december",
+    "before", "after", "between", "pending",
+    "2024", "2025", "2026", "2027", "2028", "2029", "2030",
+)
+
+
+def is_date_query(question: str) -> bool:
+    q = question.lower().strip()
+    if not any(ind in q for ind in DATE_INDICATORS):
+        return False
+    if any(q.startswith(s) for s in DATE_LIST_STARTERS):
+        return True
+    return any(tw in q for tw in DATE_TIME_WINDOWS)
+
+
+def parse_date_filter(question: str) -> dict:
+    """Ask the LLM to convert a natural-language date question into structured filters."""
+    today = date.today().isoformat()
+    prompt = f"""You convert natural-language contract-date questions into structured SQL filters.
+
+Today is {today}.
+
+Return STRICT JSON with exactly these keys (use null when not applicable):
+{{
+  "field": "expiration_date" | "effective_date" | null,
+  "min_date": "YYYY-MM-DD" | null,
+  "max_date": "YYYY-MM-DD" | null,
+  "renewal_type": "auto" | "manual" | "none" | null,
+  "contract_type": lowercase string | null
+}}
+
+Rules:
+- field: "expiration_date" for expiring/ending/renewing, "effective_date" for starting, null if neither
+- min_date / max_date: inclusive bounds; compute relative windows against today
+- renewal_type: only set when user explicitly asks about auto-renewing or manually-renewing
+- contract_type: short lowercase label (licensing, msa, nda, services, supply, employment, ...) only if user specifies
+
+Examples:
+"contracts expiring in May 2026" → {{"field":"expiration_date","min_date":"2026-05-01","max_date":"2026-05-31","renewal_type":null,"contract_type":null}}
+"pending renewals in the next 90 days" → {{"field":"expiration_date","min_date":"{today}","max_date":<today+90>,"renewal_type":null,"contract_type":null}}
+"auto-renewing contracts" → {{"field":null,"min_date":null,"max_date":null,"renewal_type":"auto","contract_type":null}}
+"licensing deals starting this year" → {{"field":"effective_date","min_date":"<Jan1>","max_date":"<Dec31>","renewal_type":null,"contract_type":"licensing"}}
+"contracts expiring before 2027" → {{"field":"expiration_date","min_date":null,"max_date":"2026-12-31","renewal_type":null,"contract_type":null}}
+"what contracts expire next month" → {{"field":"expiration_date","min_date":"<first of next month>","max_date":"<last day of next month>","renewal_type":null,"contract_type":null}}"""
+    completion = openai_client.chat.completions.create(
+        model=GENERATION_MODEL,
+        temperature=0,
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": prompt},
+            {"role": "user", "content": question},
+        ],
+    )
+    parsed = _json_module.loads(completion.choices[0].message.content)
+    # Normalise missing keys so downstream code can rely on .get()
+    return {
+        "field": parsed.get("field"),
+        "min_date": parsed.get("min_date"),
+        "max_date": parsed.get("max_date"),
+        "renewal_type": parsed.get("renewal_type"),
+        "contract_type": parsed.get("contract_type"),
+    }
+
+
+def query_metadata(flt: dict, limit: int = 100) -> list[dict]:
+    """Run the parsed filter against contract_metadata."""
+    q = supabase_client.table("contract_metadata").select("*")
+    field = flt.get("field")
+    if field in ("effective_date", "expiration_date"):
+        if flt.get("min_date"):
+            q = q.gte(field, flt["min_date"])
+        if flt.get("max_date"):
+            q = q.lte(field, flt["max_date"])
+    if flt.get("renewal_type"):
+        q = q.eq("renewal_type", flt["renewal_type"])
+    if flt.get("contract_type"):
+        q = q.ilike("contract_type", f"%{flt['contract_type']}%")
+    # Order by whichever date field is most relevant
+    order_field = field if field in ("effective_date", "expiration_date") else "expiration_date"
+    q = q.order(order_field, desc=False).limit(limit)
+    resp = q.execute()
+    return resp.data or []
+
+
+def format_date_answer(question: str, flt: dict, rows: list[dict]) -> str:
+    """Build a clean markdown answer from metadata rows — no second LLM call needed."""
+    if not rows:
+        bits = []
+        if flt.get("field"):
+            bits.append(flt["field"].replace("_", " "))
+        if flt.get("min_date") or flt.get("max_date"):
+            bits.append(f"between {flt.get('min_date') or 'any'} and {flt.get('max_date') or 'any'}")
+        if flt.get("renewal_type"):
+            bits.append(f"renewal: {flt['renewal_type']}")
+        if flt.get("contract_type"):
+            bits.append(f"type: {flt['contract_type']}")
+        criteria = ", ".join(bits) if bits else "your criteria"
+        return (
+            f"No contracts match {criteria}.\n\n"
+            "If you just ingested new contracts, run `python extract_metadata.py` "
+            "to populate their structured metadata, or ask for the clause directly "
+            "(e.g. *\"what does the renewal clause in MSA_Logistics say?\"*)."
+        )
+
+    lines = [f"**{len(rows)} contract{'s' if len(rows) != 1 else ''} matched:**\n"]
+    for i, r in enumerate(rows, 1):
+        lines.append(f"{i}. **{r['document_name']}**")
+        if r.get("contract_type"):
+            lines.append(f"   - Type: {r['contract_type']}")
+        if r.get("parties"):
+            parties = ", ".join(r["parties"][:3])
+            if len(r["parties"]) > 3:
+                parties += f" (+{len(r['parties']) - 3} more)"
+            lines.append(f"   - Parties: {parties}")
+        if r.get("effective_date"):
+            lines.append(f"   - Effective: {r['effective_date']}")
+        if r.get("expiration_date"):
+            lines.append(f"   - Expires: {r['expiration_date']}")
+        if r.get("term_months"):
+            lines.append(f"   - Term: {r['term_months']} months")
+        if r.get("renewal_type") and r["renewal_type"] != "unknown":
+            notice = r.get("auto_renewal_notice_days")
+            if r["renewal_type"] == "auto" and notice:
+                lines.append(f"   - Renewal: auto ({notice}-day notice to cancel)")
+            else:
+                lines.append(f"   - Renewal: {r['renewal_type']}")
+        if r.get("governing_law"):
+            lines.append(f"   - Governing law: {r['governing_law']}")
+        lines.append("")
+    lines.append(
+        "_Ask for a specific clause (e.g. \"show me the renewal clause in <contract>\") "
+        "if you need the exact contract language._"
+    )
+    return "\n".join(lines)
+
+
+def handle_date_query(question: str) -> tuple[str, int] | None:
+    """
+    Returns (answer_markdown, rows_found) if the question was handled as a date
+    query, or None if parsing failed / no structured filter could be derived.
+    """
+    try:
+        flt = parse_date_filter(question)
+    except Exception:
+        return None
+    # If the LLM couldn't derive any filter, fall through to normal RAG
+    if not (flt.get("field") or flt.get("renewal_type") or flt.get("contract_type")):
+        return None
+    try:
+        rows = query_metadata(flt)
+    except Exception:
+        return None
+    return format_date_answer(question, flt, rows), len(rows)
+
+
 def extract_topic_from_query(question: str) -> str:
     """Strip the 'across all contracts' part to get the core topic."""
     # First try the regex — it cleanly captures the descriptor between the
@@ -786,6 +967,19 @@ async def query(req: QueryRequest):
 
     # Rewrite follow-up questions into standalone queries before retrieval
     retrieval_question = rewrite_query_with_history(req.question, req.history)
+
+    # Date/renewal queries → exact SQL over contract_metadata
+    if is_date_query(retrieval_question):
+        date_result = handle_date_query(retrieval_question)
+        if date_result is not None:
+            answer, rows_found = date_result
+            return QueryResponse(
+                answer=answer,
+                sources=[],
+                expanded_query=f"[DATE FILTER] {retrieval_question}",
+                chunks_retrieved=rows_found,
+                time_seconds=round(time.time() - start, 2),
+            )
 
     # Auto-route: if the user asks about a topic across all contracts,
     # use the exhaustive topic scan instead of RAG
@@ -871,6 +1065,27 @@ async def query_stream(req: QueryRequest):
 
     # Rewrite follow-up questions into standalone queries before retrieval
     retrieval_question = rewrite_query_with_history(req.question, req.history)
+
+    # Date/renewal queries → exact SQL over contract_metadata (streamed as one payload)
+    if is_date_query(retrieval_question):
+        date_result = handle_date_query(retrieval_question)
+        if date_result is not None:
+            answer, rows_found = date_result
+
+            def date_stream():
+                meta = _json.dumps({
+                    "sources": [],
+                    "expanded_query": f"[DATE FILTER] {retrieval_question}",
+                    "chunks": rows_found,
+                })
+                yield f"data: {meta}\n\n"
+                chunk_size = 80
+                for i in range(0, len(answer), chunk_size):
+                    fragment = answer[i:i + chunk_size].replace("\n", "\\n")
+                    yield f"data: {fragment}\n\n"
+                yield "data: [DONE]\n\n"
+
+            return StreamingResponse(date_stream(), media_type="text/event-stream")
 
     # Auto-route broad queries to topic scan (streamed)
     if is_broad_query(retrieval_question):
