@@ -1,10 +1,12 @@
 # Profound Contract-Analysis RAG
 
-> **Recruiters:** a live demo URL is included on my CV.
-
 A retrieval-augmented generation (RAG) system for procurement contract analysis. Ingests PDFs into a Supabase pgvector store, answers natural-language questions with hybrid retrieval + cross-encoder reranking, and routes specialized queries (dates, cross-corpus scans, risk audits) through deterministic non-RAG paths where they belong.
 
 Built on FastAPI, deployed to AWS Lambda via a container image and a GitHub Actions OIDC pipeline.
+
+## Scope
+
+Built solo over two months as a proof-of-concept engagement for Profound Consulting. Validated on a 56-contract synthetic test corpus generated for development, plus a 10-contract subset of the [CUAD benchmark](https://www.atticusprojectai.org/cuad) (~70 Q&A pairs across 7 legal categories) for measured evaluation. Not deployed in production under load.
 
 ---
 
@@ -17,6 +19,15 @@ Ask questions about your contract portfolio in plain English:
 - **Date queries** — *"Contracts expiring in October 2026"* — answered via SQL over structured metadata, not vector search.
 - **Risk audit** — single-click standing scan of the whole corpus for auto-renewal traps, uncapped liability, asymmetric indemnification, IP assignment imbalances, etc.
 - **Follow-ups** — multi-turn chat with query rewriting. *"What about the renewal clause?"* resolves against the previous turn.
+
+---
+
+## Design decisions
+
+- **Deterministic routing over an agent framework.** Intent is handled by regex, with an LLM used narrowly for parsing structured fields. Classification is cheap, deterministic, and debuggable — no opaque tool-calling loop sitting between the user and retrieval.
+- **Structured metadata over LLM arithmetic.** Dates, terms, and parties are extracted once at ingest into a typed `contract_metadata` schema, so date queries route to SQL. LLMs do semantics well and arithmetic poorly.
+- **Full-corpus scan alongside RAG.** Top-k retrieval is the wrong tool when a question requires exhaustive coverage ("which contracts have X"). Separate `/scan` endpoints bypass vector search and score every chunk, then synthesize a grouped-by-document answer.
+- **Conversational memory built from scratch.** No chain framework. Frontend tracks the last 5 turns; backend rewrites follow-ups into standalone queries before retrieval.
 
 ---
 
@@ -120,7 +131,7 @@ Run: `python eval_cuad.py` (writes `cuad_eval_results.json`).
 ### Install
 
 ```bash
-git clone https://github.com/<you>/Profound_Rag_Backend.git
+git clone https://github.com/your-username/Profound_Rag_Backend.git
 cd Profound_Rag_Backend
 python -m venv venv
 source venv/bin/activate     # Windows: venv\Scripts\activate
@@ -218,7 +229,7 @@ Secrets:
 
 - Cross-encoder model is **baked into the image** at build time so cold starts skip the HuggingFace download.
 - `HF_HOME=/tmp/huggingface` — Lambda's `/var/task` is read-only.
-- Lambda timeout should be 3 minutes (some `/scan` runs can take ~60s on a 50-contract corpus).
+- Lambda timeout should be 3 minutes (some `/scan` runs can take ~60s on a 56-contract corpus).
 
 ---
 
