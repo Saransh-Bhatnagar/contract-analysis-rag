@@ -1,4 +1,4 @@
-# Profound Contract-Analysis RAG
+# Contract-Analysis RAG
 
 A retrieval-augmented generation (RAG) system for procurement contract analysis. Ingests PDFs into a Supabase pgvector store, answers natural-language questions with hybrid retrieval + cross-encoder reranking, and routes specialized queries (dates, cross-corpus scans, risk audits) through deterministic non-RAG paths where they belong.
 
