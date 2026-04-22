@@ -1,5 +1,7 @@
 # Profound Contract-Analysis RAG
 
+**Live demo:** https://ivgzghaom2if4q4puajhftvgqu0kuwnb.lambda-url.eu-west-1.on.aws/
+
 A retrieval-augmented generation (RAG) system for procurement contract analysis. Ingests PDFs into a Supabase pgvector store, answers natural-language questions with hybrid retrieval + cross-encoder reranking, and routes specialized queries (dates, cross-corpus scans, risk audits) through deterministic non-RAG paths where they belong.
 
 Built on FastAPI, deployed to AWS Lambda via a container image and a GitHub Actions OIDC pipeline.
